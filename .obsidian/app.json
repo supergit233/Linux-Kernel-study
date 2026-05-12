@@ -1,0 +1,10 @@
+{
+  "promptDelete": false,
+  "showLineNumber": true,
+  "readableLineLength": false,
+  "foldHeading": false,
+  "livePreview": true,
+  "alwaysUpdateLinks": false,
+  "showUnsupportedFiles": false,
+  "uriCallbacks": false
+}

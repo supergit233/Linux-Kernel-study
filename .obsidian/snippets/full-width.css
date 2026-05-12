@@ -1,0 +1,22 @@
+/* 可自由调整的留白宽度 */
+:root {
+  /* 在这里修改数值，控制整体宽度 */
+  --custom-line-width: 85%; 
+}
+
+body {
+  --file-line-width: var(--custom-line-width) !important;
+  --max-width: var(--custom-line-width) !important;
+}
+
+/* 编辑模式 */
+.markdown-source-view.mod-cm6 .cm-content {
+  max-width: var(--custom-line-width) !important;
+  margin: 0 auto !important;
+}
+
+/* 阅读模式 */
+.markdown-reading-view .markdown-preview-view {
+  max-width: var(--custom-line-width) !important;
+  margin: 0 auto !important;
+}
