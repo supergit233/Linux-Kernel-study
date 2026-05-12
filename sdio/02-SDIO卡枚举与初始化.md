@@ -1,4 +1,4 @@
-﻿# SDIO 卡枚举与初始化
+# SDIO 卡枚举与初始化
 
 ## 导读
 
@@ -19,7 +19,12 @@
 
 ### 关键函数
 
+- `mmc_add_host()`
+- `mmc_start_host()`
+- `mmc_rescan()`
+- `mmc_rescan_try_freq()`
 - `mmc_attach_sdio()`
+- `mmc_wait_for_cmd()`
 - `mmc_sdio_init_card()`
 - `sdio_read_cccr()`
 - `sdio_read_common_cis()`
@@ -29,34 +34,79 @@
 
 ### 主流程
 
-CMD5 识别 SDIO -> 初始化整卡 -> 读取 CCCR/CIS -> 配置速度和总线宽度 -> 创建 function -> 注册 card -> 注册 function。
+host 注册 -> rescan 扫描 host -> 优先尝试 SDIO attach -> CMD5 识别 SDIO -> 初始化整卡 -> 读取 CCCR/CIS -> 配置速度和总线宽度 -> 创建 function -> 注册 card -> 注册 function。
 
 ## 这一章按什么逻辑展开
 
-这一章按“先整卡，后 function；先 card 级公共信息，后 function 级设备对象”的逻辑展开。
+这一章按“先看 host 怎样触发扫描，再看整卡，后看 function；先 card 级公共信息，后 function 级设备对象”的逻辑展开。
 
 这样拆的原因是：
 
 - SDIO 枚举不是一上来就直接进入 `sdio_func`
+- `mmc_attach_sdio()` 也不是凭空被调用，而是 host 注册后的 rescan 流程优先尝试 SDIO attach
 - 而是 MMC core 先确认整张卡的公共能力，再继续把卡拆成多个 function
 
 所以本章后面的结构是：
 
-1. 先看入口 `mmc_attach_sdio()`
-2. 再看 `mmc_sdio_init_card()` 怎样把整张卡初始化完成
-3. 然后看 `sdio_init_func()` 怎样把 card 拆成多个 `sdio_func`
-4. 最后看 card 和 function 设备怎样进入 driver model
+1. 先看 host 注册后 rescan 怎样触发 SDIO 枚举
+2. 再看入口 `mmc_attach_sdio()`
+3. 再看 `mmc_sdio_init_card()` 怎样把整张卡初始化完成
+4. 然后看 `sdio_init_func()` 怎样把 card 拆成多个 `sdio_func`
+5. 最后看 card 和 function 设备怎样进入 driver model
 
-## 1. 入口函数
+## 1. 入口从哪里来：host 注册后的 rescan
 
-主入口：
+SDIO 枚举的主入口仍然是：
 
 - `drivers/mmc/core/sdio.c`
 - `int mmc_attach_sdio(struct mmc_host *host)`
 
-这是 MMC core 决定“当前这张卡按 SDIO 路线继续走”之后的入口。
+但这个入口不是 function driver 主动调用的，也不是设备树直接调用的，而是 MMC core 在 host 注册完成后，通过 `rescan` 流程尝试出来的。
 
-## 2. `mmc_attach_sdio()` 做了什么
+`rescan` 可以先理解成：MMC core 对一个 `mmc_host` 发起的“重新扫描/识别卡”动作。它不是 SDIO 专属流程，而是 MMC/SD/SDIO 共用的 host 扫描入口；真正走到 SDIO，是因为 `mmc_rescan_try_freq()` 里优先尝试 `mmc_attach_sdio()`。
+
+源码入口可以这样串：
+
+```text
+host driver probe                       // 例如 HI3516CV610 的 SDHCI/platform host 驱动完成 probe
+-> sdhci_add_host()                     // host 驱动把控制器注册到 SDHCI/MMC 框架
+-> mmc_add_host()                       // MMC core 注册 struct mmc_host
+-> mmc_start_host()                     // host 开始服务，并准备进行卡检测
+-> _mmc_detect_change(host, 0, false)   // 安排一次 detect delayed_work
+-> mmc_rescan()                         // delayed_work 真正执行，开始扫描这个 host
+-> mmc_rescan_try_freq()                // 按初始化频率尝试识别卡类型
+-> mmc_attach_sdio()                    // 优先尝试 SDIO attach，成功后进入本章主流程
+```
+
+这里最关键的是 `mmc_rescan_try_freq()` 的 attach 顺序：
+
+```c
+/* Order's important: probe SDIO, then SD, then MMC */
+if (!(host->caps2 & MMC_CAP2_NO_SDIO))
+	if (!mmc_attach_sdio(host))
+		return 0;
+
+if (!(host->caps2 & MMC_CAP2_NO_SD))
+	if (!mmc_attach_sd(host))
+		return 0;
+
+if (!(host->caps2 & MMC_CAP2_NO_MMC))
+	if (!mmc_attach_mmc(host))
+		return 0;
+```
+
+所以完整理解应该是：
+
+- `mmc_add_host()` 不是只把 host 对象注册出去，它还会启动 host
+- `mmc_start_host()` 会触发一次 detect/rescan
+- `mmc_rescan()` 负责扫描当前 host 上是否有卡
+- `mmc_rescan_try_freq()` 负责按 SDIO、SD、MMC 的顺序尝试 attach
+- 如果 `mmc_attach_sdio()` 成功返回 `0`，core 就认为这张卡按 SDIO 路线处理，后面不会再尝试 SD/MMC
+
+换句话说，`mmc_attach_sdio()` 是“SDIO 卡枚举入口”，但它的上游入口是 host 注册后的 `rescan`。
+
+## 2. `mmc_attach_sdio()` 做了什么，提供了一个完整的流程
+
 >[!INFO]
 ```C {31,71,86,94,13} fold:"mmc_attach_sdio"
 int mmc_attach_sdio(struct mmc_host *host)
@@ -186,7 +236,7 @@ err:
 ```
 它的主逻辑可以概括成下面几步：
 
-1. `mmc_send_io_op_cond()`：通过 `CMD5` 读 SDIO OCR
+1. `mmc_send_io_op_cond()`：通过 `CMD5` 读 SDIO OCR，第一次看作探测模式
 2. `mmc_attach_bus(host, &mmc_sdio_ops)`：把 host 绑定到 SDIO 总线逻辑
 3. `mmc_select_voltage()`：选择可工作的电压
 4. `mmc_sdio_init_card()`：初始化整张 SDIO 卡
@@ -542,7 +592,7 @@ cccr的结构在[[01-SDIO核心数据结构#1.2 `struct mmc_card`]]
 - `drivers/mmc/core/sdio.c`
 
 >[!INFO]
-```C fold:"sdio_init_func"
+```C {16,24-26} fold:"sdio_init_func"
 static int sdio_init_func(struct mmc_card *card, unsigned int fn)
 {
 	int ret;
@@ -591,7 +641,7 @@ fail:
 1. 分配 `struct sdio_func`      [[01-SDIO核心数据结构#1.3 `struct sdio_func`]]
 2. 设置 `func->num`
 3. 读取 FBR，得到 function class
-4. 读取 function 自己的 CIS
+4. 读取 function 自己的 CIS，CIS提供probe用到的id信息
 5. 把 `func` 填到 `card->sdio_func[fn - 1]`
 
 注意：
@@ -634,24 +684,36 @@ int sdio_add_func(struct sdio_func *func)
 
 ```mermaid
 flowchart TD
-    A["mmc_attach_sdio()"] --> B["CMD5 读 OCR"]
-    B --> C["mmc_sdio_init_card()"]
-    C --> D["sdio_read_cccr()"]
-    D --> E["sdio_read_common_cis()"]
-    E --> F["速度/总线宽度配置"]
-    F --> G["根据 OCR 解析 function 数量"]
-    G --> H["sdio_init_func(fn1..fnN)"]
-    H --> I["mmc_add_card()"]
-    I --> J["sdio_add_func(fn1..fnN)"]
-    J --> K["进入 sdio bus 匹配与 probe"]
+    A["host driver probe"] --> B["sdhci_add_host()"]
+    B --> C["mmc_add_host()"]
+    C --> D["mmc_start_host()"]
+    D --> E["_mmc_detect_change()"]
+    E --> F["mmc_rescan()"]
+    F --> G["mmc_rescan_try_freq()"]
+    G --> H["mmc_attach_sdio()"]
+    H --> I["CMD5 读 OCR"]
+    I --> J["mmc_sdio_init_card()"]
+    J --> K["sdio_read_cccr()"]
+    K --> L["sdio_read_common_cis()"]
+    L --> M["速度/总线宽度配置"]
+    M --> N["根据 OCR 解析 function 数量"]
+    N --> O["sdio_init_func(fn1..fnN)"]
+    O --> P["mmc_add_card()"]
+    P --> Q["sdio_add_func(fn1..fnN)"]
+    Q --> R["进入 sdio bus 匹配与 probe"]
 ```
 
-这张图可以按三段来读。
+这张图可以按三段来读。最前面的 `host driver probe -> mmc_rescan_try_freq()` 是外层触发链，作用是把 SDIO attach 找出来；从 `mmc_attach_sdio()` 开始，才进入本章后面重点展开的 SDIO 卡枚举细节。
 
 ### 7.1 第一段：先把整张卡站稳
 
 对应图里的：
 
+- `host driver probe`
+- `mmc_add_host()`
+- `mmc_start_host()`
+- `mmc_rescan()`
+- `mmc_rescan_try_freq()`
 - `mmc_attach_sdio()`
 - `CMD5 读 OCR`
 - `mmc_sdio_init_card()`
@@ -659,7 +721,7 @@ flowchart TD
 - `sdio_read_common_cis()`
 - `速度/总线宽度配置`
 
-这一段解决的是“整张卡是什么、支持什么、现在能不能稳定工作”。
+这一段解决的是两个连续问题：先确认 host 上有没有能识别的卡，再确认“这张卡是什么、支持什么、现在能不能稳定工作”。
 
 落到前面的对象上，就是：
 
@@ -728,6 +790,7 @@ flowchart TD
 
 更适合的对应关系是：
 
+- 第 `1` 节：host 注册后的 `rescan` 负责把流程带到 `mmc_attach_sdio()`
 - 第 `2` 节：`mmc_attach_sdio()` 负责启动整条 SDIO 枚举链
 - 第 `3` 节：`mmc_sdio_init_card()` 负责整卡初始化
 - 第 `4` 节：`sdio_read_cccr()` 和 `sdio_read_common_cis()` 负责补卡级公共能力
@@ -737,12 +800,193 @@ flowchart TD
 
 这样回头看，整条链实际上是：
 
+- 先注册 `mmc_host`
+- 再由 `rescan` 扫描 host 并优先尝试 SDIO attach
 - 先建立 `mmc_card`
 - 再建立多个 `sdio_func`
 - 再把这些 function 交给 `sdio bus`
 - 最后才轮到具体 `sdio_driver.probe()`
 
-## 8. 这一章最该记住的一句话
+## 8. CMD 命令是怎么从 core 发到 host 再拿 response 回来的
+
+前面图里写了 `CMD5 读 OCR`，但这里不能把它理解成“直接从 `host` 里读一个字段”。真正发生的是：
+
+```text
+MMC/SDIO core 构造 struct mmc_command
+-> 填 opcode / arg / response flags
+-> mmc_wait_for_cmd(host, &cmd, retries)
+-> mmc_wait_for_req(host, &mrq)
+-> host->ops->request(host, mrq)
+-> SDHCI host driver 把命令写进控制器寄存器
+-> 控制器在 SDIO 总线上发出 CMD
+-> card 返回 response
+-> host 中断/轮询完成 request
+-> response 填回 cmd.resp[]
+-> core 从 cmd.resp[] 取出 OCR / R5 / 状态位
+```
+
+这条链解决的是“命令怎么穿过 Linux 分层”的问题：
+
+- `core` 决定要发什么命令
+- `host` 负责把命令真正打到 SDIO 总线上
+- `card/function` 通过 response 或 data phase 回答
+- `core` 再解释 response 里的含义
+
+### 8.1 CMD5 读 OCR 的例子
+
+`mmc_attach_sdio()` 里第一步是：
+
+```c
+err = mmc_send_io_op_cond(host, 0, &ocr);
+```
+
+这句的意思不是“从 host 读取 OCR”，而是：
+
+```text
+通过 host 发 CMD5
+-> card 用 R4 response 回答 OCR/能力信息
+-> mmc_send_io_op_cond() 把 R4 response 保存到 ocr
+```
+
+对应源码在 `drivers/mmc/core/sdio_ops.c`：
+
+```c
+cmd.opcode = SD_IO_SEND_OP_COND;
+cmd.arg = ocr;
+cmd.flags = MMC_RSP_SPI_R4 | MMC_RSP_R4 | MMC_CMD_BCR;
+
+err = mmc_wait_for_cmd(host, &cmd, MMC_CMD_RETRIES);
+
+if (rocr)
+    *rocr = cmd.resp[mmc_host_is_spi(host) ? 1 : 0];
+```
+
+这里几个字段要分清：
+
+- `host`
+  - 发送命令的控制器
+  - 没有 host，命令发不到总线上
+- `ocr`
+  - 传给 card 的命令参数
+  - 第一次传 `0` 表示只探测 card 能力
+- `rocr`
+  - 从 card response 里读回来的 OCR
+  - `mmc_attach_sdio()` 里的局部变量 `ocr` 实际保存的是这个返回值
+- `cmd.resp[]`
+  - host driver 完成命令后填回来的 response 缓冲
+
+所以这一句更准确的中文注释应该是：
+
+```c
+err = mmc_send_io_op_cond(host, 0, &ocr);
+// 通过 host 发送 SDIO CMD5，读取 card 返回的 R4/OCR 能力信息
+```
+
+### 8.2 `mmc_wait_for_cmd()` 在这条链里干什么
+
+`mmc_wait_for_cmd()` 是 core 层的同步命令封装。
+
+它大致做三件事：
+
+```text
+把 mmc_command 包进 mmc_request
+-> 调 mmc_wait_for_req()
+-> 等 request 完成后返回 cmd->error
+```
+
+对应源码逻辑是：
+
+```c
+struct mmc_request mrq = {};
+
+cmd->retries = retries;
+cmd->data = NULL;
+mrq.cmd = cmd;
+
+mmc_wait_for_req(host, &mrq);
+
+return cmd->error;
+```
+
+这里的重点是：
+
+- `mmc_wait_for_cmd()` 不直接操作寄存器
+- 它只是把单条命令包装成一个 request
+- 真正发给硬件的是更下面的 host `request` 回调
+
+### 8.3 `host->ops->request()` 是 core 和 host 的分界点
+
+`mmc_wait_for_req()` 继续往下会进入 host 操作表：
+
+```text
+mmc_wait_for_req()
+-> __mmc_start_req()
+-> host->ops->request(host, mrq)
+```
+
+在标准 SDHCI host 上，这个回调就是：
+
+```c
+static const struct mmc_host_ops sdhci_ops = {
+    .request = sdhci_request,
+    ...
+};
+```
+
+所以 SDIO CMD5 在 HI3516CV610 当前这条链路里可以理解成：
+
+```text
+mmc_send_io_op_cond()
+-> mmc_wait_for_cmd()
+-> mmc_wait_for_req()
+-> host->ops->request()
+-> sdhci_request()
+-> sdhci_send_command()
+-> SDHCI 控制器发出 CMD5
+-> card 返回 R4
+-> cmd.resp[] 保存 response
+```
+
+`nebula,sdhci` 的作用是在 host 层把 HI3516CV610 控制器接进 SDHCI 框架；而 CMD 的通用发起和等待逻辑仍然走 MMC core + SDHCI host 这条标准主线。
+
+### 8.4 CMD5、CMD52、CMD53 的区别
+
+SDIO 里最常见的三类命令是：
+
+- `CMD5`
+  - `SD_IO_SEND_OP_COND`
+  - 用在 SDIO card 枚举早期
+  - response 是 `R4`
+  - 用来探测 OCR、电压、function 数量、memory present 等 card 级能力
+- `CMD52`
+  - `SD_IO_RW_DIRECT`
+  - 单字节寄存器读写
+  - response 是 `R5`
+  - 常见于 CCCR/FBR/小寄存器访问
+- `CMD53`
+  - `SD_IO_RW_EXTENDED`
+  - 多字节或多 block 数据传输
+  - response 是 `R5`，并带 data phase
+  - 常见于 FIFO、mailbox、packet buffer、批量收发
+
+这三类命令共用同一套底层通道：
+
+```text
+core 构造 mmc_command / mmc_request
+-> host->ops->request()
+-> host controller 发命令
+-> card/function 回 response/data
+-> core 解释结果
+```
+
+区别只在于：
+
+- `opcode` 不同
+- `arg` 格式不同
+- response 类型不同
+- 是否有 data phase
+- 上层语义是枚举、寄存器读写，还是批量数据传输
+
+## 9. 这一章最该记住的一句话
 
 SDIO 的 function driver 不是直接面对“插卡事件”，而是面对“已经被 core 枚举完成的 `sdio_func` 设备”。
-

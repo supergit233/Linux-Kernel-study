@@ -1,4 +1,4 @@
-﻿# SDIO 实际工程问题问答
+# SDIO 实际工程问题问答
 
 ## 学习目标
 
@@ -124,6 +124,9 @@ DTS / pinctrl / clock / power
 ### 常见检查点
 
 - `sdio0` DTS 节点是否为 `okay`：节点未启用时 platform driver 不会创建 host，后续 `mmc_add_host()` 不会发生；相关链路：`DTS status -> platform probe -> mmc_add_host`。
+>[!TIP]
+>设备树节点在系统上是/sys/firmware/devicetree，
+>总线设备驱动是在/sys/bus/
 - `mmc0` 和 `sdio0` 是否配置冲突：HI3516CV610 上 `mmc0` 与 `sdio0` 共用 `0x10030000` 控制器，选错用途会导致实际 SDIO 控制器没有按预期工作；相关链路：`hi3516cv610-demb.dts -> mmc0/sdio0 status -> nebula host`。
 - pinctrl / iomux 是否配置到 SDIO 功能：引脚仍处于 GPIO 或其他复用功能时，CMD/CLK/DATA 物理信号不通；相关链路：`DTS pinctrl -> host pins -> card response`。
 - 模组电源、复位、WL_REG_ON 是否正确：模组未上电或复位未释放时，host 发 CMD5 不会得到响应；相关链路：`power/reset -> CMD5 -> mmc_attach_sdio`。

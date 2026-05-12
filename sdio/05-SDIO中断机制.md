@@ -1,4 +1,4 @@
-﻿# SDIO 中断机制
+# SDIO 中断机制
 
 ## 导读
 
@@ -292,7 +292,42 @@ flowchart TD
 - 第 `5-6` 节是“core 分发”
 - 第 `7` 节是“退出回收”
 
-## 11. 这一章最该记住的一句话
+## 11. 和外部平台 IRQ 的边界
+
+本章前面讲的是标准 SDIO in-band IRQ。它的特点是：中断事件属于 SDIO 协议路径，由 card 通过 SDIO 总线表达，host/controller 感知后通知 MMC/SDIO core，再由 core 分发给 function driver。
+
+```text
+sdio_claim_irq(func, handler)             // function driver 注册标准 SDIO IRQ handler
+-> CCCR_IENx / master enable              // SDIO core 通过 CMD52 打开 function IRQ 使能
+-> card asserts SDIO interrupt            // card 在 SDIO 协议层产生 in-band IRQ
+-> host/controller detects SDIO IRQ       // host 感知 SDIO IRQ 条件
+-> mmc_signal_sdio_irq(host)              // host 把事件通知给 MMC/SDIO core
+-> sdio_irq_thread()                      // core 在线程上下文处理 SDIO IRQ
+-> process_sdio_pending_irqs()            // core 读取 pending bit 并定位具体 function
+-> func->irq_handler(func)                // 最终回调 function driver 注册的 handler
+```
+
+外部平台 IRQ，也常被驱动文档叫 out-of-band IRQ，是另一条路。它不是 SDIO 协议里的 IRQ，而是模组额外拉出的一根 GPIO/GIC 中断线，通常写在 function child node 下面。
+
+```text
+wifi@1 { interrupts = <...>; }            // 设备树描述 function 额外的外部中断线
+-> mmc_of_find_child_device()             // 枚举 function 时把 child node 挂到 func->dev.of_node
+-> of_irq_get() / platform_get_irq()      // function driver 从 of_node 解析成 Linux IRQ 号
+-> devm_request_threaded_irq()            // function driver 注册普通 Linux IRQ handler/thread
+-> external GPIO/GIC IRQ fires            // 模组额外中断线触发，走平台 IRQ 子系统
+-> driver irq thread                      // 进入 function driver 自己注册的线程化 IRQ
+-> sdio_claim_host(func) if doing I/O     // 如果 handler 内要访问 SDIO 寄存器/数据，需要自己 claim host
+-> sdio_readb() / sdio_memcpy_fromio()    // 再通过 CMD52/CMD53 读取芯片状态或数据
+```
+
+这里最容易混的是 DTS 里的 `interrupts`。
+
+- host 节点里的 `interrupts = <GIC_SPI 42 IRQ_TYPE_LEVEL_HIGH>` 描述的是 HI3516CV610 SDIO host controller 的控制器中断，属于 `sdhci`/host 层资源
+- function child node 里的 `interrupts = <...>` 才描述外设模组额外拉出的 out-of-band IRQ，属于具体 function driver 自己消费的资源
+- 标准 SDIO in-band IRQ 不靠 function child node 的 `interrupts` 触发，它靠 `sdio_claim_irq()`、CCCR 中断使能、host 的 `mmc_signal_sdio_irq()` 和 `sdio_irq_thread()` 串起来
+
+因此，中断不来时必须先分清问的是哪条路径：host 控制器自己的 IRQ、SDIO 协议内生 IRQ，还是模组额外的外部平台 IRQ。三条路共用“中断”这个词，但管理层级和回调入口完全不同。
+
+## 12. 这一章最该记住的一句话
 
 SDIO function 的 IRQ handler 不是“裸跑”的，它是通过 `host -> mmc core -> sdio_irq.c -> func->irq_handler` 这条链被调起来的，而且调用时 host 通常已经被 core claim 住了。
-

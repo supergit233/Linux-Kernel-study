@@ -752,6 +752,3 @@ Linux 5.10 的 `cfg80211` 文档说明，现代无线驱动都应直接或间接
 
 之后再沿四条线读：`probe/init`、`TX`、`RX/IRQ`、`suspend/resume`。这四条线串起来，整个 SDIO WiFi 驱动基本就读通了。相关 PM 钩子在 `sdio_bus.c` 总线侧也能看到，而 `mwifiex` 搜索结果里也直接展示了 `resume/suspend` 相关实现。([GitHub](https://github.com/torvalds/linux/blob/master/drivers/mmc/core/sdio_bus.c?utm_source=chatgpt.com))
 
-你要是愿意，我下一条可以直接继续做两种之一：
-**A：按 5.10 源码把 `mwifiex_sdio_probe()` 逐函数带你读一遍**，或者
-**B：把 `brcmfmac SDIO` 的初始化、收发、IRQ、firmware 下载调用链画成一张“源码调用图”给你。**

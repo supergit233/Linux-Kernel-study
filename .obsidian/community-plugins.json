@@ -1,4 +1,6 @@
 [
   "code-styler",
-  "obsidian-hover-editor"
+  "obsidian-hover-editor",
+  "code-link",
+  "auto-replacer"
 ]
