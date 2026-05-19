@@ -28,9 +28,9 @@
 
 ```text
 录制原始视频                         // 保留明显手抖和转动
--> 同步保存 gyro CSV                  // 至少包含 timestamp,gx,gy,gz
+-> 同步保存 IMU CSV                   // 至少包含 timestamp,accel,gyro,temp
 -> 离线读取视频帧                     // 获取 frame index 和 frame timestamp
--> 读取 gyro 样本                     // 检查采样率、单位和时间范围
+-> 读取 IMU 样本                      // 检查采样率、单位、时间范围和三类数据是否合理
 -> 做时间对齐和零偏修正                // 先把最基础输入修正好
 -> 计算每帧补偿                       // 用简化积分和平滑算法
 -> OpenCV warp 输出                   // 生成稳定后视频
@@ -43,13 +43,29 @@
 
 ## 1. 数据格式建议
 
-gyro CSV 至少包含：
+IMU CSV 建议至少包含：
 
 ```text
-timestamp_ns,gx_rad_s,gy_rad_s,gz_rad_s
+timestamp_ns,ax_g,ay_g,az_g,gx_rad_s,gy_rad_s,gz_rad_s,temp_c
 ```
 
-如果当前数据不是 `rad/s`，建议离线转换后再保存一份，避免算法里反复混单位。
+如果当前程序已经输出 `gyro=(...)dps`，建议离线转换后再保存一份 `rad/s`，避免算法里反复混单位。转换关系是：
+
+```text
+rad/s = deg/s * 0.01745329252
+```
+
+如果还想保留排查能力，可以额外保存 raw 值：
+
+```text
+timestamp_ns,raw_ax,raw_ay,raw_az,raw_temp,raw_gx,raw_gy,raw_gz,ax_g,ay_g,az_g,gx_dps,gy_dps,gz_dps,temp_c
+```
+
+第一版算法可以只读取 `gx_rad_s/gy_rad_s/gz_rad_s`，但 `ax_g/ay_g/az_g/temp_c` 不建议丢掉：
+
+- `accel` 用来检查静止段重力是否合理，辅助确认板子姿态和轴向。
+- `gyro` 用来做零偏估计、角速度积分和防抖补偿。
+- `temp` 用来观察热机过程中 gyro 零偏是否漂移。
 
 视频侧至少需要：
 
@@ -65,7 +81,7 @@ timestamp_ns,gx_rad_s,gy_rad_s,gz_rad_s
 第一版不要追求复杂：
 
 ```text
-读取 gyro CSV                         // 得到时间序列角速度
+读取 IMU CSV                          // 得到时间序列 accel/gyro/temp
 -> 静止段估计 bias                     // 简单求均值
 -> gx/gy/gz 减 bias                    // 去零偏
 -> 按帧 timestamp 采样或积分             // 得到每帧旋转量
@@ -80,6 +96,8 @@ timestamp_ns,gx_rad_s,gy_rad_s,gz_rad_s
 
 - gyro 三轴原始曲线
 - gyro 去零偏后的曲线
+- accel 三轴曲线和合成值，静止段应接近 `1g`
+- temp 曲线，观察温度变化时 gyro bias 是否也变化
 - frame timestamp 与 gyro timestamp 覆盖范围
 - raw rotation path
 - smooth rotation path

@@ -98,13 +98,13 @@ bootm / bootz                         // U-Boot 准备 kernel image、dtb、boot
 
 ## 4. 设备树和 bootargs 被谁消费
 
-| 输入 | 来源 | 内核消费位置 | 后续影响 |
-| --- | --- | --- | --- |
-| `dtb` | U-Boot 加载并传给内核 | 架构早期和 `setup_arch()` 阶段解析 | 生成内存节点、`chosen`、CPU、interrupt-controller、timer、platform device 等 |
-| `bootargs` | U-Boot 环境变量或 `chosen.bootargs` | 内核参数解析路径消费 | 决定 `console=`、`root=`、`init=`、调试参数和部分驱动行为 |
-| `memory` 节点 | DTS 中描述，也可能被 U-Boot 修正 | 早期内存初始化消费 | 影响可用内存范围、保留内存和早期崩溃风险 |
-| `compatible` | DTS 节点声明硬件身份 | platform/OF match 消费 | 决定对应 platform driver 是否能 probe |
-| `interrupts` / clock / reset | DTS 节点描述板级资源 | IRQ、clock、reset 子系统和具体驱动消费 | 决定驱动 probe 后能否正常工作 |
+| 输入                           | 来源                             | 内核消费位置                     | 后续影响                                                             |
+| ---------------------------- | ------------------------------ | -------------------------- | ---------------------------------------------------------------- |
+| `dtb`                        | U-Boot 加载并传给内核                 | 架构早期和 `setup_arch()` 阶段解析  | 生成内存节点、`chosen`、CPU、interrupt-controller、timer、platform device 等 |
+| `bootargs`                   | U-Boot 环境变量或 `chosen.bootargs` | 内核参数解析路径消费                 | 决定 `console=`、`root=`、`init=`、调试参数和部分驱动行为                        |
+| `memory` 节点                  | DTS 中描述，也可能被 U-Boot 修正         | 早期内存初始化消费                  | 影响可用内存范围、保留内存和早期崩溃风险                                             |
+| `compatible`                 | DTS 节点声明硬件身份                   | platform/OF match 消费       | 决定对应 platform driver 是否能 probe                                   |
+| `interrupts` / clock / reset | DTS 节点描述板级资源                   | IRQ、clock、reset 子系统和具体驱动消费 | 决定驱动 probe 后能否正常工作                                               |
 
 这也是内核移植里最常见的判断线：设备没 probe，先看 `compatible` 和节点状态；probe 了但工作异常，再看 `reg`、`interrupts`、clock、reset、pinctrl、regulator 等资源。
 

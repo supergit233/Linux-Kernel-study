@@ -1,4 +1,0 @@
-interface:
-  display_name: "Kernel Driver Study"
-  short_description: "Linux 内核驱动源码学习、结构化整理与工程排查模板"
-  default_prompt: "Use $kernel-driver-study to analyze a Linux kernel driver, build study notes, or locate an engineering issue."

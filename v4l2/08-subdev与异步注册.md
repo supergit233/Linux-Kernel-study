@@ -4,12 +4,34 @@
 
 ### 本章定位
 
-这一章聚焦 `subdev` 对象本身，以及 `async notifier` 怎样把外部 sensor/bridge 和 host 匹配到一起。前一章的 `entity/pad/link` 负责建图，本章的重点是“先找到模块，再挂进 host 管理”。
+这一章是 `09-典型subdev驱动例子-imx219` 的前置知识章，先把 `subdev` 自身讲完整，再进入具体 sensor 驱动。  
+前一章的 `entity/pad/link` 负责建图，本章继续回答四个问题：
+
+- `subdev` 作为对象本身包含什么
+- 它什么时候只是管线内部模块，什么时候又会变成 `/dev/v4l-subdevX`
+- 用户态访问 `v4l-subdevX` 时，`open/ioctl` 怎样进入 `subdev` 回调
+- `async notifier` 又怎样把外部 sensor/bridge 挂进 host 管理
+
+这样到 `09` 章再看 `imx219` 时，就可以把注意力放在“这个 sensor 怎样填写这些框架接口”，而不是一边读示例驱动一边补框架地基。
 
 ### 核心对象
 
 - `struct v4l2_subdev`
   - 管线内部功能模块对象
+- `struct v4l2_subdev_ops`
+  - `subdev` 对外业务回调表，按 `core/video/pad/...` 分组
+- `struct v4l2_subdev_internal_ops`
+  - `subdev` 节点注册、打开、关闭等内部生命周期回调表
+- `struct v4l2_subdev_fh`
+  - `/dev/v4l-subdevX` 每个文件句柄对应的上下文对象
+- `struct video_device`
+  - 当 `subdev` 暴露成 `/dev/v4l-subdevX` 时，外层仍由它承载字符设备节点
+- `struct v4l2_ctrl_handler`
+  - 一组 V4L2 controls 的管理对象，`subdev` 和后续 devnode 都会通过它找到控制项
+- `struct v4l2_ctrl`
+  - 单个控制项，例如曝光、增益、翻转
+- `struct v4l2_ctrl_ops`
+  - control 值变化后回调到驱动的操作表
 - `struct v4l2_async_subdev`
   - async 框架里的匹配描述对象
 - `struct v4l2_async_notifier`
@@ -21,13 +43,20 @@
 
 - `v4l2_subdev_init()`
 - `v4l2_i2c_subdev_init()`
+- `__v4l2_device_register_subdev_nodes()`
+- `subdev_open()`
+- `subdev_ioctl()`
+- `subdev_do_ioctl()`
+- `v4l2_subdev_call()`
 - `v4l2_async_register_subdev()`
 - `v4l2_async_register_subdev_sensor_common()`
 - `v4l2_device_register_subdev()`
 
 ### 主流程
 
-初始化 `subdev` -> 初始化 `entity/pad` -> async 注册 -> host notifier 等待 -> 匹配成功 -> 挂到 `v4l2_dev->subdevs` -> 后续由 host 建图
+注册期主线：初始化 `subdev` -> 初始化 `entity/pad` -> async 注册 -> host notifier 等待 -> 匹配成功 -> 挂到 `v4l2_dev->subdevs` -> 可选暴露 `/dev/v4l-subdevX`
+
+使用期主线：`open("/dev/v4l-subdevX")` -> `subdev_open()` -> `ioctl()` -> `subdev_ioctl()` -> `subdev_do_ioctl()` -> `pad/video/core/control` 回调
 
 ## 1. 为什么 V4L2 要有 `subdev`
 
@@ -395,7 +424,376 @@ int media_entity_pads_init(struct media_entity *entity, u16 num_pads,
 
 如果没有 pad/entity，很多媒体管线信息就没法建立起来。
 
-## 7. 为什么需要异步注册
+## 7. 先补一个后面会反复出现的对象：`ctrl_handler`
+
+`ctrl` 可以先理解成“用户或框架可调的一个参数”，例如：
+
+- 曝光
+- 模拟增益
+- 数字增益
+- 水平翻转
+- 垂直翻转
+
+这些参数不能散落在驱动里各管各的，所以 V4L2 control 框架会再提供一个上层容器：
+
+- `struct v4l2_ctrl_handler`
+
+源码注释对它的定义很直接：
+
+- `include/media/v4l2-ctrls.h:331`
+  - 它负责跟踪一组 controls，既包括自己拥有的，也包括从其他 handler 继承进来的
+
+### 7.1 三个 control 对象先分开
+
+| 对象 | 最小理解 | 解决的问题 |
+| --- | --- | --- |
+| `struct v4l2_ctrl_handler` | 一组 controls 的管理器 | 这些参数归谁统一管理、怎样被查找 |
+| `struct v4l2_ctrl` | 一个具体控制项 | 这个参数本身是什么、当前值和范围是什么 |
+| `struct v4l2_ctrl_ops` | control 的回调表 | 参数变化后谁真正执行 |
+
+可以先压成这条关系：
+
+```text
+driver private struct
+-> ctrl_handler                         // 管一组 control
+   -> exposure / gain / flip / ...      // 每个具体 control
+      -> ctrl_ops.s_ctrl                // 参数变化后回调到驱动
+```
+
+### 7.2 `ctrl_handler` 里大致管什么
+
+当前阶段不需要把 `struct v4l2_ctrl_handler` 的所有字段都背下来，但至少要知道它管理四类东西：
+
+| 成员类别 | 代表字段 | 作用 |
+| --- | --- | --- |
+| 自己拥有的 controls | `ctrls` | 保存本 handler 创建出的控制项 |
+| 可查询的 control 引用 | `ctrl_refs`、`buckets`、`cached` | 让框架按 control id 快速找到目标 control，也支持合并别的 handler 的 controls |
+| 并发保护 | `lock` | 设置 control 时保护这一组参数 |
+| 初始化错误状态 | `error` | 任一 control 创建失败时先记住错误，便于 probe 统一检查 |
+
+因此它不是“某一个曝光值”，而更像“这台设备的一整组参数管理入口”。
+
+### 7.3 为什么 `subdev` 里要挂 `sd.ctrl_handler`
+
+因为 `subdev` 也可能直接承载 controls。  
+sensor 驱动通常会在 probe 阶段：
+
+```text
+v4l2_ctrl_handler_init()                 // 先建立 handler
+-> v4l2_ctrl_new_std()                   // 往 handler 里注册曝光、增益等 ctrl
+-> sd.ctrl_handler = &driver_ctrl_hdlr  // 把这组 controls 挂到 subdev
+```
+
+以后如果这个 `subdev` 被暴露成 `/dev/v4l-subdevX`：
+
+- `__v4l2_device_register_subdev_nodes()`
+  - 会让外层 `video_device` 继承 `sd->ctrl_handler`
+- `v4l2_fh_init()`
+  - 再让文件句柄继承 `vdev->ctrl_handler`
+- `subdev_do_ioctl()`
+  - 处理 `VIDIOC_S_CTRL` 时通过 `vfh->ctrl_handler` 找到具体 control
+
+所以后面看到：
+
+```text
+vdev->ctrl_handler = sd->ctrl_handler
+vfh->ctrl_handler
+v4l2_s_ctrl(vfh, vfh->ctrl_handler, ...)
+```
+
+时，它们不是三个不同的参数系统，而是同一组 controls 沿着：
+
+```text
+subdev -> devnode -> file handle
+```
+
+一路传下来的结果。
+
+### 7.4 和 `09` 章怎么分工
+
+本章只先回答“`ctrl_handler` 是什么，为什么 `subdev` 需要它”。  
+到了 `09` 章，再用 `imx219` 具体展开：
+
+- 它怎样创建曝光、增益、翻转这些 control
+- `V4L2_CID_EXPOSURE` 怎样落到真实寄存器
+- `VIDIOC_S_CTRL` 怎样从用户态一路回调到 `imx219_set_ctrl()`
+
+## 8. `subdev` 什么时候只是内部对象，什么时候会变成 `/dev/v4l-subdevX`
+
+`subdev` 的本体始终是 `struct v4l2_subdev`，它先解决的是“管线内部模块”这个问题。  
+是否额外暴露成 `/dev/v4l-subdevX`，取决于后续是否满足节点创建条件，而不是 `subdev` 一初始化就天然有用户态节点。
+
+### 8.1 `V4L2_SUBDEV_FL_HAS_DEVNODE` 只是声明“需要节点”
+
+以 `imx219` 为例，probe 里会设置：
+
+```c
+imx219->sd.flags |= V4L2_SUBDEV_FL_HAS_DEVNODE;
+```
+
+这一步只表达：
+
+- 这个 `subdev` 希望后续拥有自己的 subdev devnode
+- 允许用户态直接通过 `/dev/v4l-subdevX` 操作它
+
+但它本身还不会立刻创建字符设备节点。  
+真正创建节点的是 host 侧后续调用：
+
+- `drivers/media/v4l2-core/v4l2-device.c:189`
+  `__v4l2_device_register_subdev_nodes()`
+
+### 8.2 节点暴露时，外面仍然包了一层 `video_device`
+
+源码已经明确说明，`v4l-subdevX` 不是绕开 `video_device` 单独注册的另一套字符设备。  
+它的创建路径是：
+
+```text
+sd.flags |= V4L2_SUBDEV_FL_HAS_DEVNODE                  // subdev 声明希望暴露 devnode
+-> v4l2_device_register_subdev(v4l2_dev, sd)            // 先把真实 sd 挂到 host 管理下
+-> __v4l2_device_register_subdev_nodes(v4l2_dev, ...)   // host 主动为 eligible subdev 建节点
+-> kzalloc(struct video_device)                         // 为这个 subdev 包一层 vdev
+-> video_set_drvdata(vdev, sd)                          // 让外层 vdev 反向找到真实 sd
+-> vdev->fops = &v4l2_subdev_fops                       // 指定 subdev 专用文件操作
+-> vdev->ctrl_handler = sd->ctrl_handler                // 节点直接继承该 subdev 的 controls
+-> __video_register_device(..., VFL_TYPE_SUBDEV, ...)   // 最终生成 /dev/v4l-subdevX
+-> sd->devnode = vdev                                   // sd 记录自己的外层 devnode
+```
+
+这一段来自：
+
+- `drivers/media/v4l2-core/v4l2-device.c:189`
+  `__v4l2_device_register_subdev_nodes()`
+
+因此这里要同时记住两层对象：
+
+| 层次 | 对象 | 负责什么 |
+| --- | --- | --- |
+| 真实模块层 | `struct v4l2_subdev` | 代表 sensor/bridge/ISP 等内部功能模块 |
+| 字符设备承载层 | `struct video_device` | 负责把它包装成 `/dev/v4l-subdevX` |
+
+### 8.3 与 `/dev/videoX` 的根本差异
+
+`/dev/videoX` 和 `/dev/v4l-subdevX` 都可能由 `video_device` 承载，但它们表达的对象不同：
+
+| 节点 | 背后的核心对象 | 主要面向谁 | 典型职责 |
+| --- | --- | --- | --- |
+| `/dev/videoX` | capture/output 一侧的 `video_device` | 普通应用程序 | buffer、streaming、最终图像输入输出 |
+| `/dev/v4l-subdevX` | 管线内部 `v4l2_subdev` 的 devnode 包装 | 调试工具、media 管线配置工具、专业应用 | pad format、selection、frame interval、直接 control |
+
+因此：
+
+- sensor 常常不注册 `/dev/videoX`
+- 但 sensor 可以拥有 `/dev/v4l-subdevX`
+- 两者不是“谁替代谁”，而是分属不同职责层
+
+还要补一个边界：这套用户态 subdev devnode API 受 `CONFIG_VIDEO_V4L2_SUBDEV_API` 控制。  
+如果内核没有打开它，源码中的 `subdev_open()` / `subdev_ioctl()` 会退化成直接返回 `-ENODEV` 的桩函数；也就是说，`subdev` 对象本身仍可存在，但用户态不一定能直接打开它。
+
+## 9. `/dev/v4l-subdevX` 的 `open` 与文件句柄模型
+
+### 9.1 `subdev` 节点的 `open` 主线
+
+`/dev/v4l-subdevX` 仍然复用 V4L2 通用字符设备入口，真正分叉发生在第二层 `fops`：
+
+```text
+open("/dev/v4l-subdevX")                      // 用户打开 subdev devnode
+-> v4l2_fops.open = v4l2_open()               // V4L2 字符设备统一入口
+-> vdev->fops->open = subdev_open()           // subdev 节点专用 open
+-> subdev_fh_init()                           // 为该文件句柄准备 TRY pad 配置
+-> v4l2_fh_init()                             // 建立通用 v4l2_fh，并继承 ctrl_handler
+-> file->private_data = &subdev_fh->vfh       // 后续 ioctl 从 file 找回当前句柄
+-> sd->internal_ops->open(sd, subdev_fh)      // 如驱动实现，则进入私有 open
+```
+
+关键源码：
+
+- `drivers/media/v4l2-core/v4l2-subdev.c:44`
+  `subdev_open()`
+- `drivers/media/v4l2-core/v4l2-fh.c:21`
+  `v4l2_fh_init()`
+
+### 9.2 为什么还要有 `struct v4l2_subdev_fh`
+
+普通 `video_device` 的文件句柄重点常放在：
+
+- 权限
+- controls
+- 事件
+- queue 访问
+
+而 `subdev` 节点还额外需要保存“每个文件句柄自己的临时 pad 状态”。  
+这就是：
+
+- `struct v4l2_subdev_fh`
+  - 内嵌一个通用 `struct v4l2_fh`
+  - 还带一个 `struct v4l2_subdev_pad_config *pad`
+
+源码位置：
+
+- `include/media/v4l2-subdev.h:922`
+  `struct v4l2_subdev_fh`
+
+当 `sd->entity.num_pads` 非零时，`subdev_fh_init()` 会调用：
+
+```c
+fh->pad = v4l2_subdev_alloc_pad_config(sd);
+```
+
+这块 per-file pad 配置，正是后续 `TRY` format 的落点。  
+所以在 sensor 驱动里看到：
+
+- `internal_ops->open`
+- `v4l2_subdev_get_try_format()`
+- `V4L2_SUBDEV_FORMAT_TRY`
+
+时，应把它们和 `v4l2_subdev_fh->pad` 连起来看。  
+这也是 `09` 章里 `imx219_open()` 能为每个打开者准备默认 TRY format 的前提。
+
+### 9.3 `internal_ops` 和 `ops` 不是一回事
+
+这两个表都挂在 `struct v4l2_subdev` 上，但职责完全不同：
+
+| 对象 | 关注阶段 | 典型成员 | 谁来调用 |
+| --- | --- | --- | --- |
+| `v4l2_subdev_internal_ops` | 对象生命周期、devnode 生命周期 | `registered`、`unregistered`、`open`、`close` | V4L2 core |
+| `v4l2_subdev_ops` | 业务操作 | `core`、`video`、`pad`、`sensor` | host、subdev ioctl、其他框架代码 |
+
+以 `imx219` 为例：
+
+- `imx219_internal_ops.open = imx219_open`
+  - 处理 subdev 文件句柄打开时的私有准备
+- `imx219_subdev_ops.pad.set_fmt = imx219_set_pad_format`
+  - 处理 pad 格式协商
+
+两者不能混成同一类“回调”。
+
+## 10. `/dev/v4l-subdevX` 的 `ioctl` 主线
+
+### 10.1 先把完整调用链压平
+
+对于普通 `video_device`，`03` 章已经建立了这条主线：
+
+```text
+v4l2_fops.unlocked_ioctl
+-> v4l2_ioctl()
+-> vdev->fops->unlocked_ioctl
+-> video_ioctl2()
+-> video_usercopy()
+-> __video_do_ioctl()
+-> v4l2_ioctl_ops->vidioc_*
+```
+
+`subdev` 前半段一致，真正分叉点在第二层 `unlocked_ioctl`：
+
+```text
+v4l2_fops.unlocked_ioctl                          // 所有 V4L2 字符设备共用的 VFS 入口
+-> v4l2_ioctl()                                   // 取出 video_device，转交给 vdev->fops
+-> vdev->fops->unlocked_ioctl                     // 对 subdev devnode，实际是 v4l2_subdev_fops.unlocked_ioctl
+-> subdev_ioctl()                                 // subdev 节点专用 ioctl 入口
+-> video_usercopy(..., subdev_do_ioctl_lock)      // 仍复用通用用户态参数拷贝框架
+-> subdev_do_ioctl_lock()                         // 加锁，并确认节点仍处于 registered 状态
+-> subdev_do_ioctl()                              // subdev 专用派发核心
+```
+
+关键源码：
+
+- `drivers/media/v4l2-core/v4l2-dev.c:353`
+  `v4l2_ioctl()`
+- `drivers/media/v4l2-core/v4l2-subdev.c:682`
+  `subdev_ioctl()`
+- `drivers/media/v4l2-core/v4l2-subdev.c:667`
+  `subdev_do_ioctl_lock()`
+- `drivers/media/v4l2-core/v4l2-subdev.c:354`
+  `subdev_do_ioctl()`
+- `drivers/media/v4l2-core/v4l2-subdev.c:732`
+  `v4l2_subdev_fops`
+
+### 10.2 `subdev_do_ioctl()` 不是 `__video_do_ioctl()` 的换名版本
+
+两者都位于 ioctl 派发末端，但职责不同：
+
+| 派发核心 | 面向对象 | 主要分发到哪里 |
+| --- | --- | --- |
+| `__video_do_ioctl()` | 普通 video node | `v4l2_ioctl_ops->vidioc_*` |
+| `subdev_do_ioctl()` | subdev devnode | `v4l2_subdev_call()` 或 control 框架 |
+
+因此不能把 `subdev` 路径记成：
+
+```text
+subdev_ioctl()
+-> __video_do_ioctl()
+-> v4l2_ioctl_ops
+```
+
+源码里并不是这样。  
+`subdev` 节点没有走 `video_ioctl2() -> __video_do_ioctl()` 这一套，而是走自己的 `subdev_do_ioctl()`。
+
+### 10.3 `subdev_do_ioctl()` 里常见命令会落到哪里
+
+| 用户态 ioctl | `subdev_do_ioctl()` 中的下游 | 最终回调类型 | 典型含义 |
+| --- | --- | --- | --- |
+| `VIDIOC_SUBDEV_G_FMT` | `v4l2_subdev_call(sd, pad, get_fmt, ...)` | `sd->ops->pad->get_fmt` | 读取 pad 格式 |
+| `VIDIOC_SUBDEV_S_FMT` | `v4l2_subdev_call(sd, pad, set_fmt, ...)` | `sd->ops->pad->set_fmt` | 设置 pad 格式 |
+| `VIDIOC_SUBDEV_G_FRAME_INTERVAL` | `v4l2_subdev_call(sd, video, g_frame_interval, ...)` | `sd->ops->video->g_frame_interval` | 读取帧间隔 |
+| `VIDIOC_SUBDEV_S_FRAME_INTERVAL` | `v4l2_subdev_call(sd, video, s_frame_interval, ...)` | `sd->ops->video->s_frame_interval` | 设置帧间隔 |
+| `VIDIOC_S_CTRL` | `v4l2_s_ctrl(vfh, vfh->ctrl_handler, ...)` | `ctrl->ops->s_ctrl` | 设置 control |
+| `VIDIOC_SUBSCRIBE_EVENT` | `v4l2_subdev_call(sd, core, subscribe_event, ...)` | `sd->ops->core->subscribe_event` | 订阅事件 |
+| 未被框架单独识别的命令 | `v4l2_subdev_call(sd, core, ioctl, cmd, arg)` | `sd->ops->core->ioctl` | 私有或扩展 ioctl 兜底 |
+
+这张表把 `subdev` 的四类入口分开了：
+
+- `pad`
+  - 处理格式、裁剪、selection、mbus code 等 pad 级协商
+- `video`
+  - 处理帧间隔、标准、时序等视频语义
+- `core`
+  - 处理事件、调试、私有扩展
+- `control`
+  - 走通用 control 框架，不直接归到 `subdev_ops` 某个分组里
+
+### 10.4 `v4l2_subdev_call()` 是什么
+
+`v4l2_subdev_call(sd, group, func, ...)` 是 `subdev` 框架统一调业务回调的宏。  
+它会先检查：
+
+1. `sd` 是否为空
+2. `sd->ops->group` 是否存在
+3. 目标回调 `func` 是否存在
+
+若目标回调不存在，通常返回 `-ENOIOCTLCMD`；存在时才真正调用：
+
+```text
+v4l2_subdev_call(sd, pad, set_fmt, ...)        // 先检查 pad ops 是否存在
+-> wrapper 或 sd->ops->pad->set_fmt(sd, ...)    // 再进入包装层或驱动实现
+```
+
+源码位置：
+
+- `include/media/v4l2-subdev.h:1140`
+  `v4l2_subdev_call`
+
+这就是 host 驱动在运行期调用：
+
+```c
+v4l2_subdev_call(sd, video, s_stream, 1);
+```
+
+以及 subdev devnode ioctl 最终能落进同一套 `ops` 的原因。
+
+### 10.5 和 `09` 章的连接点
+
+到这里，`09` 章里的几个动作就都有了前置解释：
+
+- `imx219_subdev_ops.pad.set_fmt`
+  - 对应 `VIDIOC_SUBDEV_S_FMT`
+- `imx219_internal_ops.open`
+  - 对应 `subdev_open()` 最后的私有 open 回调
+- `imx219->sd.ctrl_handler`
+  - 会在创建 `/dev/v4l-subdevX` 时挂到外层 `video_device`
+- `VIDIOC_S_CTRL`
+  - 会从 `subdev_do_ioctl()` 进入 control 框架，再落到 sensor 驱动的 `s_ctrl`
+
+## 11. 为什么需要异步注册
 
 在真实系统里：
 
@@ -406,7 +804,7 @@ int media_entity_pads_init(struct media_entity *entity, u16 num_pads,
 如果强依赖 probe 顺序，驱动就会很脆弱。  
 所以 V4L2 用 notifier 机制做异步匹配。
 
-### 7.1 host 侧 notifier 一般先做什么
+### 11.1 host 侧 notifier 一般先做什么
 
 异步模型不是只在 sensor 侧调用一个 `v4l2_async_register_subdev()` 就结束。  
 真正完整的异步模型有两条线同时进行：
@@ -431,7 +829,7 @@ host 侧最常见的三步是：
 
 到这里，host 侧才算真正进入“等待外部 subdev 到来”的状态。
 
-### 7.2 这一章真正的两条并行主线
+### 11.2 这一章真正的两条并行主线
 
 把 `subdev` 和 notifier 放到同一张时间线上，更容易看清后面的匹配点：
 
@@ -454,7 +852,7 @@ find_match()
 -> complete()
 ```
 
-## 8. `v4l2_async_register_subdev()`
+## 12. `v4l2_async_register_subdev()`
 
 源码：
 
@@ -544,7 +942,7 @@ err_unbind:
 
 常见链表[[v4l2驱动总结#核心队列（链表）的**总结日志**]]
 
-### 8.1 `v4l2_async_subdev` 在这里怎么参与匹配
+### 12.1 `v4l2_async_subdev` 在这里怎么参与匹配
 
 `v4l2_async_register_subdev(sd)` 这一条路径里，真正被拿来做比较的是：
 
@@ -575,7 +973,7 @@ err_unbind:
 
 这样 `subdev` 和“等待模板”之间就建立了关联。
 
-### 8.2 `v4l2_async_notifier` 在这里做什么
+### 12.2 `v4l2_async_notifier` 在这里做什么
 
 在 `v4l2_async_register_subdev(sd)` 这条路径里，notifier 主要承担三件事：
 
@@ -591,7 +989,7 @@ err_unbind:
 
 - host 侧的匹配管理器
 
-### 8.3 匹配成功后真正发生了什么
+### 12.3 匹配成功后真正发生了什么
 
 这一段是最容易被一笔带过的地方。
 
@@ -609,7 +1007,7 @@ err_unbind:
 - 不是先 `bound()` 再注册 `subdev`
 - 而是先把 `sd` 纳入 host 管理，再进入 `bound()/complete()`
 
-### 8.4 这一章里三者到底怎么协作
+### 12.4 这一章里三者到底怎么协作
 
 把 `subdev`、`async_subdev`、`notifier` 再压成一句最核心的话：
 
@@ -622,7 +1020,7 @@ err_unbind:
 
 三者一起工作，才形成这一章的完整异步模型。
 
-## 9. `v4l2_async_register_subdev_sensor_common()`
+## 13. `v4l2_async_register_subdev_sensor_common()`
 
 源码：
 
@@ -681,7 +1079,7 @@ out_cleanup:
 所以 `imx219.c:1477` 直接调用它，能省掉一大段样板代码。
 
 
-## 10. `imx219.c` 的 subdev 初始化流程
+## 14. `imx219.c` 的 subdev 初始化流程
 >[!TIP]
 >总结：
 
@@ -824,36 +1222,15 @@ error_power_off:
 
 - sensor 先把自己建模成一个可被绑定的 subdev
 - 真正什么时候接到 host 上，由异步匹配决定
-## 11. `subdev` 什么时候会变成 `/dev/v4l-subdevX`
-
-这点很容易误解。
-
-不是设置了：
-
-```c
-sd.flags |= V4L2_SUBDEV_FL_HAS_DEVNODE;
-```
-
-就会立刻出现设备节点。
-
-还需要某个上层调用：
-
-- `drivers/media/v4l2-core/v4l2-device.c:189`
-  `__v4l2_device_register_subdev_nodes()`
-
-或者它的封装 API。
-
-这个函数会为带 `V4L2_SUBDEV_FL_HAS_DEVNODE` 的 subdev 分配一个 `video_device`，再调用 `__video_register_device(..., VFL_TYPE_SUBDEV, ...)`。
-
-## 12. 主机侧一般怎么和 subdev 交互
+## 15. 主机侧一般怎么和 subdev 交互
 
 常见方式有两种：
 
-### 12.1 注册时绑定
+### 15.1 注册时绑定
 
 host 通过 notifier 的 `bound()` 回调拿到 subdev 指针。
 
-### 12.2 运行时调用
+### 15.2 运行时调用
 
 host 用：
 
@@ -869,7 +1246,39 @@ v4l2_device_call_until_err(&v4l2_dev, 0, video, s_stream, 1);
 
 去通知整个管线开始或停止流。
 
-## 13. 异步模型的核心价值
+## 16. 全流程总结
+
+```text
+sensor probe()                                              // 底层总线匹配后进入具体 sensor 驱动
+-> v4l2_i2c_subdev_init()                                   // 把私有结构中的 sd 初始化成真实 subdev 对象
+-> sd.ops / sd.internal_ops / sd.ctrl_handler               // 填好业务回调、内部回调和 controls 入口
+-> media_entity_pads_init()                                 // 建立 entity/pad，准备进入 media graph
+-> v4l2_async_register_subdev_sensor_common()               // 把 sensor 交给 async 框架
+-> host notifier 匹配成功                                   // 找到等待它的 async_subdev 描述
+-> v4l2_device_register_subdev()                            // 把 sd 正式挂到 host 的 v4l2_dev->subdevs
+-> __v4l2_device_register_subdev_nodes()                    // host 可选地为 sd 建立 devnode
+-> /dev/v4l-subdevX                                         // 用户态可以直接访问这个内部模块节点
+-> open() -> subdev_open()                                  // 建立 v4l2_subdev_fh 与 TRY pad 配置
+-> ioctl() -> subdev_ioctl()                                // 进入 subdev 专用 ioctl 入口
+-> video_usercopy() -> subdev_do_ioctl_lock()               // 统一搬运用户参数并做串行化
+-> subdev_do_ioctl()                                        // 按命令类型继续分发
+-> pad/video/core 回调，或 v4l2_ctrl 框架                   // 落到 set_fmt、s_stream、s_ctrl 等具体能力
+```
+
+这一章的闭环可以按四段看：
+
+- `对象建立`
+  - `subdev` 先成为真实模块对象
+- `图与归属`
+  - `entity/pad` 让它进入媒体图，async 框架让它归到 host
+- `节点暴露`
+  - host 可选把它包装成 `/dev/v4l-subdevX`
+- `用户态使用`
+  - `open/ioctl` 再把请求导向 `internal_ops`、`subdev_ops` 或 control 框架
+
+读完这条总线，再进入 `09` 看 `imx219`，就能把示例驱动中的每个填写点放回对应阶段，而不是把它们看成一串互不相干的 API。
+
+## 17. 异步模型的核心价值
 
 ```mermaid
 flowchart TD
@@ -884,21 +1293,21 @@ flowchart TD
 
 它把“谁先 probe”这个问题从驱动逻辑里拿掉了。
 
-## 14. 最容易出问题的地方
+## 18. 最容易出问题的地方
 
-### 14.1 DT/fwnode 信息不一致
+### 18.1 DT/fwnode 信息不一致
 
 匹配条件不对时，subdev 会一直留在等待链表里。
 
-### 14.2 pad/entity 没初始化完整
+### 18.2 pad/entity 没初始化完整
 
 后面媒体链路创建和格式协商会很别扭。
 
-### 14.3 以为 sensor 自己会注册 `/dev/videoX`
+### 18.3 以为 sensor 自己会注册 `/dev/videoX`
 
 大多数 sensor 驱动不会这么做，它通常只注册 `subdev`。
 
-## 15. 一句话总结
+## 19. 一句话总结
 
-`subdev` 负责描述媒体管线里的组件，`async notifier` 负责把这些组件在运行时拼起来。  
+`subdev` 先描述媒体管线里的内部组件，再按需暴露为 `/dev/v4l-subdevX`，由 `subdev_open()`、`subdev_do_ioctl()` 和 `v4l2_subdev_call()` 把用户请求导向对应回调；`async notifier` 则负责把这些组件在运行时拼回 host 管理。  
 这也是为什么 camera 类 V4L2 驱动看起来总比普通字符设备驱动更“分层”。
